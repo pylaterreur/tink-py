@@ -1,0 +1,188 @@
+# CI probe for three fixes on top of tink-crypto/tink-py main (not on PR 103):
+#
+#   stream-finalizer.patch  Make streaming AEAD streams safe to close from
+#                           their finalizers.
+#   windows-bazelisk.patch  Start bazelisk.cmd and bazel.cmd when building on
+#                           Windows.
+#   linux-pip-tests.patch   Run the unit tests in the Linux pip job again.
+#
+# Each job checks out upstream main at a fixed commit and applies only the
+# patches it names, then runs the Kokoro script unmodified. Jobs named
+# "...-main" are controls without the fix.
+name: ci-probe-fixes
+
+on:
+  # Only registers the workflow.
+  push:
+    branches: [ci-probe-py315]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_MAIN: fdaa14d0851d491fc9238a73ef0d7ed68dd9b0b9
+
+jobs:
+  register:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Registered. Run it with gh workflow run ci-probe-fixes.yml --ref ci-probe-py315"
+
+  linux:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Bazel py_tests with the default Python (3.10) and with 3.14.
+          - name: bazel-linux-stream-finalizer
+            patches: stream-finalizer
+            script: bazel
+          # kokoro/gcp_ubuntu/pip: control, the fix, and the fix plus the
+          # stream fix run with Python 3.14.
+          - name: pip-linux-main
+            patches: ''
+            script: pip
+            python: '3.12'
+          - name: pip-linux-linux-pip-tests
+            patches: linux-pip-tests
+            script: pip
+            python: '3.12'
+          - name: pip-linux-py3.14-linux-pip-tests-stream-finalizer
+            patches: linux-pip-tests stream-finalizer
+            script: pip
+            python: '3.14'
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: probe
+      - uses: actions/checkout@v7
+        with:
+          repository: tink-crypto/tink-py
+          ref: ${{ env.UPSTREAM_MAIN }}
+          path: src
+      - if: matrix.python != ''
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Apply ${{ matrix.patches }}
+        working-directory: src
+        env:
+          PATCHES: ${{ matrix.patches }}
+        run: |
+          set -euxo pipefail
+          for p in ${PATCHES}; do
+            git apply -v "../probe/.github/ci-probe-fixes/${p}.patch"
+          done
+          git status --short
+          python3 --version
+          command -v bazelisk bazel python3
+      - name: protoc 30.2 (as kokoro/testutils/install_protoc.sh installs it on Kokoro)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          export KOKORO_ROOT=ci-probe
+          source ./kokoro/testutils/install_protoc.sh
+          dirname "$(command -v protoc)" >> "${GITHUB_PATH}"
+          protoc --version
+      - name: Bazel tests (kokoro/gcp_ubuntu/bazel/run_tests.sh, then with Python 3.14)
+        if: matrix.script == 'bazel'
+        working-directory: src
+        run: |
+          set -euo pipefail
+          bash ./kokoro/gcp_ubuntu/bazel/run_tests.sh
+          bash ./kokoro/testutils/run_bazel_tests.sh \
+            -t --@rules_python//python/config_settings:python_version=3.14 .
+      # The test script of kokoro/gcp_ubuntu/pip/run_tests.sh, with KOKORO_ROOT
+      # set as on Kokoro: install_tink_via_pip.sh only installs tink then.
+      # (run_tests.sh itself would then also copy KMS credentials, which the
+      # job without -k does not use.)
+      - name: kokoro/gcp_ubuntu/pip/test_script.sh
+        if: matrix.script == 'pip'
+        working-directory: src
+        run: |
+          set -euo pipefail
+          KOKORO_ROOT=ci-probe bash ./kokoro/gcp_ubuntu/pip/test_script.sh 2>&1 \
+            | tee ../pip.log
+      - name: What the pip job ran
+        if: always() && matrix.script == 'pip'
+        run: |
+          files=$(grep -c '^Running tests under Python' pip.log || true)
+          ignored=$(grep -c '^Exception ignored' pip.log || true)
+          line="RESULT: ${{ matrix.name }}: ${files} test files run, ${ignored} 'Exception ignored', $(grep -m1 -oE '^Running tests under Python [0-9.]+' pip.log || echo 'no Python test output')"
+          echo "${line}" | tee -a "${GITHUB_STEP_SUMMARY}"
+
+  windows:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-pip-main
+            patches: ''
+          - name: windows-pip-windows-bazelisk
+            patches: windows-bazelisk
+    name: ${{ matrix.name }}
+    runs-on: windows-2022
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: probe
+      - uses: actions/checkout@v7
+        with:
+          repository: tink-crypto/tink-py
+          ref: ${{ env.UPSTREAM_MAIN }}
+          # kokoro/gcp_windows/pip/run_tests.bat expects
+          # %KOKORO_ARTIFACTS_DIR%\git\tink_py.
+          path: git/tink_py
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - name: Apply ${{ matrix.patches }}
+        shell: pwsh
+        working-directory: git/tink_py
+        env:
+          PATCHES: ${{ matrix.patches }}
+        run: |
+          foreach ($p in ($env:PATCHES -split ' ' | Where-Object { $_ })) {
+            git apply -v "../../probe/.github/ci-probe-fixes/$p.patch"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          git status --short
+      - name: The image's bazelisk (npm shim) as setup.py finds it
+        shell: pwsh
+        run: |
+          Get-Command bazelisk, bazel -All -ErrorAction SilentlyContinue | Format-Table Name, Source
+          python -c "import shutil, sys; print(sys.version); print('shutil.which:', shutil.which('bazelisk'), shutil.which('bazel'))"
+      - name: kokoro/gcp_windows/pip/run_tests.bat
+        id: runbat
+        shell: cmd
+        continue-on-error: ${{ matrix.patches == '' }}
+        env:
+          KOKORO_ARTIFACTS_DIR: ${{ github.workspace }}
+        run: |
+          CALL "%KOKORO_ARTIFACTS_DIR%\git\tink_py\kokoro\gcp_windows\pip\run_tests.bat" > "%KOKORO_ARTIFACTS_DIR%\runbat.log" 2>&1
+          SET RC=%ERRORLEVEL%
+          TYPE "%KOKORO_ARTIFACTS_DIR%\runbat.log"
+          EXIT /B %RC%
+      - name: Result
+        if: always()
+        shell: pwsh
+        run: |
+          $log = Get-Content runbat.log -Raw
+          $files = ([regex]::Matches($log, '(?m)^Running tests under Python')).Count
+          $ignored = ([regex]::Matches($log, '(?m)^Exception ignored')).Count
+          $bazelisk = if ($log -match "command 'bazelisk' failed: None") { "setup.py could not start bazelisk" } else { "bazelisk started" }
+          $line = "RESULT: ${{ matrix.name }}: run_tests.bat ${{ steps.runbat.outcome }}; $bazelisk; $files test files run; $ignored 'Exception ignored'"
+          Write-Output $line
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line
+          # The control must fail the way the fix addresses; the fix must pass.
+          if ("${{ matrix.patches }}" -eq "") {
+            if ($bazelisk -ne "setup.py could not start bazelisk") { exit 1 }
+          } elseif ("${{ steps.runbat.outcome }}" -ne "success") { exit 1 }

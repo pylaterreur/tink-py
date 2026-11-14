@@ -1,0 +1,44 @@
+From 599c82d36749054c3bf1d0fc1455e70ffac41dbf Mon Sep 17 00:00:00 2001
+From: Pierre-Yves Le Borgne <pylaterreur@gmail.com>
+Date: Sat, 14 Nov 2026 14:40:40 +0000
+Subject: [PATCH] Start bazelisk.cmd and bazel.cmd when building on Windows.
+
+setup.py looked for bazelisk or bazel with shutil.which(), but then ran
+the bare name. On Windows, subprocess (CreateProcess) only adds .exe to
+a bare name, so a bazelisk installed with npm, which is a bazelisk.cmd
+batch file (as on the GitHub Actions Windows images), was found but not
+started, and the build failed with "error: command 'bazelisk' failed:
+None". On Windows, run the path that shutil.which() found; it resolves
+the name through PATHEXT, as cmd.exe does for the Windows Kokoro
+scripts. Linux and macOS still run the bare name.
+
+Claude-Session: https://claude.ai/code/session_01GwUvhmzgfkiZ6vo4uGyesN
+---
+ setup.py | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/setup.py b/setup.py
+index 8ad2473..f766dae 100644
+--- a/setup.py
++++ b/setup.py
+@@ -58,10 +58,13 @@ def _get_tink_version() -> str:
+ 
+ def _get_bazel_command() -> str:
+   """Finds the bazel command."""
+-  if shutil.which('bazelisk'):
+-    return 'bazelisk'
+-  elif shutil.which('bazel'):
+-    return 'bazel'
++  for command in ('bazelisk', 'bazel'):
++    path = shutil.which(command)
++    if path:
++      # On Windows, the command can be a batch file, e.g. bazelisk.cmd when
++      # bazelisk is installed with npm. shutil.which finds it through PATHEXT,
++      # but subprocess only starts it given its path.
++      return path if platform.system() == 'Windows' else command
+   raise FileNotFoundError(
+       'Could not find bazel executable. Please install '
+       'bazel to compile the Tink Python package.'
+-- 
+2.51.0
+

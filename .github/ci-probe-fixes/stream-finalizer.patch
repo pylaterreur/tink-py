@@ -1,0 +1,453 @@
+From a209d3d931d18cac29daad6f3b4ebe65f3d0784f Mon Sep 17 00:00:00 2001
+From: Pierre-Yves Le Borgne <pylaterreur@gmail.com>
+Date: Sat, 14 Nov 2026 14:26:52 +0000
+Subject: [PATCH] Make streaming AEAD streams safe to close from their
+ finalizers.
+
+io.IOBase.__del__ calls close() on any stream that is not closed yet,
+including one whose __init__ raised. Since Python 3.13 it reports
+exceptions from that call (gh-62948), and close() raised there in two
+cases:
+
+- RewindableInputStream, RawEncryptingStream and
+  _DecryptingStreamWrapper raised AttributeError when their __init__
+  had failed, e.g. on an unreadable or unwritable file, because close()
+  used attributes that were not set yet.
+- When closing the wrapped stream failed, close() raised before the
+  stream was marked closed, so the finalizer called close() again. For
+  RawEncryptingStream, that raised "FAILED_PRECONDITION: Stream closed".
+
+Each one printed "Exception ignored in: ..." on stderr, 10 times in the
+streaming AEAD tests on Python 3.13 and 3.14. close() now skips what
+__init__ did not set up, and marks the stream closed even if closing
+the wrapped stream fails, as io.IOBase.close() does when flush() fails.
+
+Claude-Session: https://claude.ai/code/session_01GwUvhmzgfkiZ6vo4uGyesN
+---
+ tink/streaming_aead/BUILD.bazel               |  1 +
+ tink/streaming_aead/_decrypting_stream.py     | 10 ++--
+ .../streaming_aead/_decrypting_stream_test.py |  9 ++++
+ tink/streaming_aead/_encrypting_stream.py     | 13 +++--
+ ...ybind11_python_file_object_adapter_test.py | 49 ++++++++++++-------
+ .../_rewindable_input_stream.py               | 11 ++++-
+ .../_rewindable_input_stream_test.py          | 21 ++++++--
+ tink/streaming_aead/_streaming_aead_test.py   | 40 ++++++++++++---
+ .../streaming_aead/_streaming_aead_wrapper.py | 19 ++++---
+ .../_streaming_aead_wrapper_test.py           | 18 +++++--
+ tink/testing/bytes_io.py                      |  8 +++
+ tink/testing/bytes_io_test.py                 | 10 ++++
+ 12 files changed, 163 insertions(+), 46 deletions(-)
+
+diff --git a/tink/streaming_aead/BUILD.bazel b/tink/streaming_aead/BUILD.bazel
+index e18bd68..620dfb4 100644
+--- a/tink/streaming_aead/BUILD.bazel
++++ b/tink/streaming_aead/BUILD.bazel
+@@ -61,6 +61,7 @@ py_test(
+         ":streaming_aead",
+         requirement("absl-py"),
+         "//tink/core",
++        "//tink/testing:bytes_io",
+     ],
+ )
+ 
+diff --git a/tink/streaming_aead/_decrypting_stream.py b/tink/streaming_aead/_decrypting_stream.py
+index f68dc0f..e14a51b 100644
+--- a/tink/streaming_aead/_decrypting_stream.py
++++ b/tink/streaming_aead/_decrypting_stream.py
+@@ -123,9 +123,13 @@ class RawDecryptingStream(io.RawIOBase):
+     """Close the stream. Has no effect on a closed stream."""
+     if self.closed:  # pylint:disable=using-constant-test
+       return
+-    if self._close_ciphertext_source:
+-      self._ciphertext_source.close()
+-    super().close()
++    try:
++      if self._close_ciphertext_source:
++        self._ciphertext_source.close()
++    finally:
++      # Mark the stream closed even if closing ciphertext_source failed, so
++      # that io.IOBase.__del__ does not try again.
++      super().close()
+ 
+   def readable(self) -> bool:
+     """Return True if the stream can be read from."""
+diff --git a/tink/streaming_aead/_decrypting_stream_test.py b/tink/streaming_aead/_decrypting_stream_test.py
+index 7123008..939d0c7 100644
+--- a/tink/streaming_aead/_decrypting_stream_test.py
++++ b/tink/streaming_aead/_decrypting_stream_test.py
+@@ -21,6 +21,7 @@ from absl.testing import absltest
+ from tink import core
+ from tink import streaming_aead
+ from tink.streaming_aead import _raw_streaming_aead
++from tink.testing import bytes_io
+ 
+ # Using malformed UTF-8 sequences to ensure there is no accidental decoding.
+ B_X80 = b'\x80'
+@@ -87,6 +88,14 @@ class DecryptingStreamTest(absltest.TestCase):
+     self.assertFalse(ds.seekable())
+     self.assertFalse(ds.isatty())
+ 
++  def test_close_closes_stream_if_closing_source_fails(self):
++    ds = get_raw_decrypting_stream(
++        bytes_io.FailingCloseBytesIO(B_SOMETHING_), B_AAD_,
++        close_ciphertext_source=True)
++    with self.assertRaises(OSError):
++      ds.close()
++    self.assertTrue(ds.closed)
++
+ 
+ if __name__ == '__main__':
+   absltest.main()
+diff --git a/tink/streaming_aead/_encrypting_stream.py b/tink/streaming_aead/_encrypting_stream.py
+index 9764083..374d324 100644
+--- a/tink/streaming_aead/_encrypting_stream.py
++++ b/tink/streaming_aead/_encrypting_stream.py
+@@ -101,9 +101,16 @@ class RawEncryptingStream(io.RawIOBase):
+     """Flush and close the stream. Has no effect on a closed stream."""
+     if self.closed:  # pylint:disable=using-constant-test
+       return
+-    self.flush()
+-    self._close_cc_encrypting_stream()
+-    super().close()
++    try:
++      self.flush()
++      # io.IOBase.__del__ calls close() also when __init__ raised, before
++      # _cc_encrypting_stream was set.
++      if hasattr(self, '_cc_encrypting_stream'):
++        self._close_cc_encrypting_stream()
++    finally:
++      # Mark the stream closed even if closing failed: the C++ stream cannot
++      # be closed again, and io.IOBase.__del__ would otherwise try.
++      super().close()
+ 
+   def writable(self) -> bool:
+     """Return True if the stream supports writing."""
+diff --git a/tink/streaming_aead/_pybind11_python_file_object_adapter_test.py b/tink/streaming_aead/_pybind11_python_file_object_adapter_test.py
+index fe77f3f..e2c4fc2 100644
+--- a/tink/streaming_aead/_pybind11_python_file_object_adapter_test.py
++++ b/tink/streaming_aead/_pybind11_python_file_object_adapter_test.py
+@@ -13,9 +13,12 @@
+ # limitations under the License.
+ """Tests for exception (non-)propagation in Pybind11PythonFileObjectAdapter."""
+ 
++import gc
+ import io
++import sys
+ 
+ from absl.testing import absltest
++from absl.testing.absltest import mock
+ 
+ import tink
+ from tink import streaming_aead
+@@ -53,28 +56,31 @@ class BytesIOThatThrowsExceptionsOnClose(io.BytesIO):
+     return b''
+ 
+   def close(self):
++    super().close()
+     raise tink.TinkError('Called close!')
+ 
+ 
+ class Pybind11PythonFileObjectAdaterTest(absltest.TestCase):
+ 
+-  # This and the following tests do not use the `with` statement. This is done
+-  # for two reasons:
+-  # 1. consistency with the `test_close_throws()`: there, exit from the
+-  #    context created by the `with` statement causes the `close()` function
+-  #    to be called after `assertRaises()` verified that it throws -- thus
+-  #    one more exception is raised, and the test fails.
+-  # 2. avoiding similar unexpected sideffects in the other tests
++  # These tests call close() directly instead of using the `with` statement,
++  # to check the exception that close() raises.
+   def test_write_throws(self):
+     streaming_aead_primitive = get_primitive()
+ 
+-    ciphertext_destination = BytesIOThatThrowsExceptionsOnReadWrite()
+-    enc_stream = streaming_aead_primitive.new_encrypting_stream(
+-        ciphertext_destination, b'associated_data')
+-    # The exception is thrown but swallowed on the way.
+-    _ = enc_stream.write(b'plaintext')
+-    # The exception is thrown and is not swallowed.
+-    self.assertRaises(tink.TinkError, enc_stream.close)
++    with mock.patch.object(sys, 'unraisablehook') as unraisablehook:
++      ciphertext_destination = BytesIOThatThrowsExceptionsOnReadWrite()
++      enc_stream = streaming_aead_primitive.new_encrypting_stream(
++          ciphertext_destination, b'associated_data')
++      # The exception is thrown but swallowed on the way.
++      _ = enc_stream.write(b'plaintext')
++      # The exception is thrown and is not swallowed.
++      self.assertRaises(tink.TinkError, enc_stream.close)
++      # The failed close() still closes the stream, so that its finalizer does
++      # not try again.
++      self.assertTrue(enc_stream.closed)
++      del enc_stream, ciphertext_destination
++      gc.collect()
++    unraisablehook.assert_not_called()
+ 
+   def test_read_throws(self):
+     streaming_aead_primitive = get_primitive()
+@@ -88,10 +94,17 @@ class Pybind11PythonFileObjectAdaterTest(absltest.TestCase):
+   def test_close_throws(self):
+     streaming_aead_primitive = get_primitive()
+ 
+-    ciphertext_destination = BytesIOThatThrowsExceptionsOnClose()
+-    enc_stream = streaming_aead_primitive.new_encrypting_stream(
+-        ciphertext_destination, b'associated_data')
+-    self.assertRaises(tink.TinkError, enc_stream.close)
++    with mock.patch.object(sys, 'unraisablehook') as unraisablehook:
++      ciphertext_destination = BytesIOThatThrowsExceptionsOnClose()
++      enc_stream = streaming_aead_primitive.new_encrypting_stream(
++          ciphertext_destination, b'associated_data')
++      self.assertRaises(tink.TinkError, enc_stream.close)
++      # The failed close() still closes the stream, so that its finalizer does
++      # not try again.
++      self.assertTrue(enc_stream.closed)
++      del enc_stream, ciphertext_destination
++      gc.collect()
++    unraisablehook.assert_not_called()
+ 
+ 
+ if __name__ == '__main__':
+diff --git a/tink/streaming_aead/_rewindable_input_stream.py b/tink/streaming_aead/_rewindable_input_stream.py
+index 18bc834..6c03630 100644
+--- a/tink/streaming_aead/_rewindable_input_stream.py
++++ b/tink/streaming_aead/_rewindable_input_stream.py
+@@ -87,5 +87,12 @@ class RewindableInputStream(io.RawIOBase):
+     """Close the stream and the wrapped input_stream."""
+     if self.closed:  # pylint:disable=using-constant-test
+       return
+-    self._input_stream.close()
+-    super().close()
++    try:
++      # io.IOBase.__del__ calls close() also when __init__ raised, before
++      # _input_stream was set.
++      if hasattr(self, '_input_stream'):
++        self._input_stream.close()
++    finally:
++      # Mark the stream closed even if closing input_stream failed, so that
++      # io.IOBase.__del__ does not try again.
++      super().close()
+diff --git a/tink/streaming_aead/_rewindable_input_stream_test.py b/tink/streaming_aead/_rewindable_input_stream_test.py
+index 335190d..2b2f7fc 100644
+--- a/tink/streaming_aead/_rewindable_input_stream_test.py
++++ b/tink/streaming_aead/_rewindable_input_stream_test.py
+@@ -13,11 +13,14 @@
+ # limitations under the License.
+ """Tests for tink.python.tink.util.bytes_io."""
+ 
++import gc
+ import io
++import sys
+ import tempfile
+ from typing import BinaryIO, cast
+ from absl.testing import absltest
+ from absl.testing import parameterized
++from absl.testing.absltest import mock
+ 
+ from tink.streaming_aead import _rewindable_input_stream
+ from tink.testing import bytes_io
+@@ -114,9 +117,21 @@ class RewindableInputStreamTest(parameterized.TestCase):
+       self.assertEqual(b'The quick brown fox', f.read())
+ 
+   def test_nonreadable_input_fail(self):
+-    with tempfile.TemporaryFile('wb') as f:
+-      with self.assertRaises(ValueError):
+-        _ = _rewindable_input_stream.RewindableInputStream(cast(BinaryIO, f))
++    with mock.patch.object(sys, 'unraisablehook') as unraisablehook:
++      with tempfile.TemporaryFile('wb') as f:
++        with self.assertRaises(ValueError):
++          _ = _rewindable_input_stream.RewindableInputStream(cast(BinaryIO, f))
++      gc.collect()
++    # Finalizing the partially initialized stream must not raise (Python 3.13+
++    # prints such exceptions as "Exception ignored in ...").
++    unraisablehook.assert_not_called()
++
++  def test_close_closes_stream_if_closing_input_stream_fails(self):
++    f = _rewindable_input_stream.RewindableInputStream(
++        cast(BinaryIO, bytes_io.FailingCloseBytesIO(b'The quick brown fox')))
++    with self.assertRaises(OSError):
++      f.close()
++    self.assertTrue(f.closed)
+ 
+ 
+ class RewindableInputStreamSlowTest(parameterized.TestCase):
+diff --git a/tink/streaming_aead/_streaming_aead_test.py b/tink/streaming_aead/_streaming_aead_test.py
+index 3d7a897..3a0eb6d 100644
+--- a/tink/streaming_aead/_streaming_aead_test.py
++++ b/tink/streaming_aead/_streaming_aead_test.py
+@@ -13,14 +13,18 @@
+ # limitations under the License.
+ """Tests for tink.python.tink.streaming_aead.streaming_aead."""
+ 
++import gc
+ import io
+ import os
++import sys
+ import tempfile
+ 
+ from absl.testing import absltest
++from absl.testing.absltest import mock
+ 
+ import tink
+ from tink import streaming_aead
++from tink.testing import bytes_io
+ 
+ 
+ def setUpModule():
+@@ -102,17 +106,39 @@ class StreamingAeadTest(absltest.TestCase):
+       filename = os.path.join(tmpdirname, 'file')
+       with open(filename, 'wb') as f:
+         f.write(b'data')
+-      with open(filename, 'rb') as dest:  # dest is not writable
+-        with self.assertRaises(ValueError):
+-          primitive.new_encrypting_stream(dest, b'aad')
++      with mock.patch.object(sys, 'unraisablehook') as unraisablehook:
++        with open(filename, 'rb') as dest:  # dest is not writable
++          with self.assertRaises(ValueError):
++            primitive.new_encrypting_stream(dest, b'aad')
++        gc.collect()
++    # Finalizing the partially initialized stream must not raise (Python 3.13+
++    # prints such exceptions as "Exception ignored in ...").
++    unraisablehook.assert_not_called()
+ 
+   def test_decrypt_fails_on_nonreadable_stream(self):
+     primitive = get_primitive()
+     with tempfile.TemporaryDirectory() as tmpdirname:
+-      # src not readable
+-      with open(os.path.join(tmpdirname, 'file2'), 'wb') as src:
+-        with self.assertRaises(ValueError):
+-          primitive.new_decrypting_stream(src, b'aad')
++      with mock.patch.object(sys, 'unraisablehook') as unraisablehook:
++        # src not readable
++        with open(os.path.join(tmpdirname, 'file2'), 'wb') as src:
++          with self.assertRaises(ValueError):
++            primitive.new_decrypting_stream(src, b'aad')
++        gc.collect()
++    # Finalizing the partially initialized stream must not raise (Python 3.13+
++    # prints such exceptions as "Exception ignored in ...").
++    unraisablehook.assert_not_called()
++
++  def test_decrypt_close_closes_stream_if_closing_source_fails(self):
++    primitive = get_primitive()
++    ct_destination = bytes_io.BytesIOWithValueAfterClose()
++    with primitive.new_encrypting_stream(ct_destination, b'aad') as es:
++      es.write(b'data')
++    src = bytes_io.FailingCloseBytesIO(ct_destination.value_after_close())
++    ds = primitive.new_decrypting_stream(src, b'aad')
++    self.assertEqual(ds.read(), b'data')
++    with self.assertRaises(OSError):
++      ds.close()
++    self.assertTrue(ds.closed)
+ 
+ if __name__ == '__main__':
+   absltest.main()
+diff --git a/tink/streaming_aead/_streaming_aead_wrapper.py b/tink/streaming_aead/_streaming_aead_wrapper.py
+index 122bbab..cab0022 100644
+--- a/tink/streaming_aead/_streaming_aead_wrapper.py
++++ b/tink/streaming_aead/_streaming_aead_wrapper.py
+@@ -127,12 +127,19 @@ class _DecryptingStreamWrapper(io.RawIOBase):
+   def close(self) -> None:
+     if self.closed:  # pylint:disable=using-constant-test
+       return
+-    if self._matching_stream:
+-      self._matching_stream.close()
+-    if self._attempting_stream:
+-      self._attempting_stream.close()
+-    self._ciphertext_source.close()
+-    super().close()
++    try:
++      # io.IOBase.__del__ calls close() also when __init__ raised. Then
++      # _attempting_stream, which __init__ sets last, is not set.
++      if hasattr(self, '_attempting_stream'):
++        if self._matching_stream:
++          self._matching_stream.close()
++        if self._attempting_stream:
++          self._attempting_stream.close()
++        self._ciphertext_source.close()
++    finally:
++      # Mark the stream closed even if closing ciphertext_source failed, so
++      # that io.IOBase.__del__ does not try again.
++      super().close()
+ 
+   def readable(self) -> bool:
+     return True
+diff --git a/tink/streaming_aead/_streaming_aead_wrapper_test.py b/tink/streaming_aead/_streaming_aead_wrapper_test.py
+index 639c255..84ea940 100644
+--- a/tink/streaming_aead/_streaming_aead_wrapper_test.py
++++ b/tink/streaming_aead/_streaming_aead_wrapper_test.py
+@@ -13,11 +13,14 @@
+ # limitations under the License.
+ """Tests for tink.python.tink.streaming_aead._streaming_aead_wrapper."""
+ 
++import gc
+ import io
++import sys
+ from typing import BinaryIO, cast
+ 
+ from absl.testing import absltest
+ from absl.testing import parameterized
++from absl.testing.absltest import mock
+ from tink.proto import aes_gcm_hkdf_streaming_pb2
+ from tink.proto import common_pb2
+ from tink.proto import tink_pb2
+@@ -108,11 +111,18 @@ class StreamingAeadWrapperTest(parameterized.TestCase):
+     plaintext = b'plaintext'
+     aad = b'associated_data'
+ 
+-    ciphertext_dest = bytes_io.BadWriteBytesIO()
+-    with self.assertRaises(tink.TinkError):
++    with mock.patch.object(sys, 'unraisablehook') as unraisablehook:
++      ciphertext_dest = bytes_io.BadWriteBytesIO()
+       es = primitive.new_encrypting_stream(ciphertext_dest, aad)
+-      es.write(plaintext)
+-      es.close()
++      with self.assertRaises(tink.TinkError):
++        es.write(plaintext)
++        es.close()
++      # The failed close() still closes the stream, so that its finalizer does
++      # not try again.
++      self.assertTrue(es.closed)
++      del es, ciphertext_dest
++      gc.collect()
++    unraisablehook.assert_not_called()
+ 
+   def test_encrypt_decrypt_with_slow_readable_raw_bytes_success(self):
+     keyset_handle = tink.new_keyset_handle(TEMPLATE)
+diff --git a/tink/testing/bytes_io.py b/tink/testing/bytes_io.py
+index 60db409..7af0f3a 100644
+--- a/tink/testing/bytes_io.py
++++ b/tink/testing/bytes_io.py
+@@ -133,3 +133,11 @@ class BadWriteBytesIO(BytesIOWithValueAfterClose):
+     # On every third call: write and return an invalid written length.
+     bytes_written = super().write(b)
+     return bytes_written + 1
++
++
++class FailingCloseBytesIO(io.BytesIO):
++  """A BytesIO whose close() closes it, and then raises OSError."""
++
++  def close(self) -> None:
++    super().close()
++    raise OSError('close failed')
+diff --git a/tink/testing/bytes_io_test.py b/tink/testing/bytes_io_test.py
+index a962b24..cccd55d 100644
+--- a/tink/testing/bytes_io_test.py
++++ b/tink/testing/bytes_io_test.py
+@@ -182,5 +182,15 @@ class BadWriteBytesIOTest(absltest.TestCase):
+       self.assertEqual(len2, 1)  # 0 + 1
+ 
+ 
++class FailingCloseBytesIOTest(absltest.TestCase):
++
++  def test_close(self):
++    f = bytes_io.FailingCloseBytesIO(b'data')
++    self.assertEqual(f.read(), b'data')
++    with self.assertRaises(OSError):
++      f.close()
++    self.assertTrue(f.closed)
++
++
+ if __name__ == '__main__':
+   absltest.main()
+-- 
+2.51.0
+

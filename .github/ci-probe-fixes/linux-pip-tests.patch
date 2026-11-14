@@ -1,0 +1,34 @@
+From 87aff499d9e7d5d34fc1960c11aa566a44ec2c8f Mon Sep 17 00:00:00 2001
+From: Pierre-Yves Le Borgne <pylaterreur@gmail.com>
+Date: Sat, 14 Nov 2026 14:54:43 +0000
+Subject: [PATCH] Run the unit tests in the Linux pip job again.
+
+kokoro/gcp_ubuntu/pip/test_script.sh passed "${TEST_EXCLUDE}" to find,
+which expands to the first element of the array only ("-not"). find
+then looked for directories named *_test.py, found none, and xargs ran
+python3 once without arguments, which exits with 0. So since
+e057852 (June 2024) the job has not run any of the tests under tink/,
+with or without KMS. Expand the whole array: without -k, find now
+returns the 59 test files outside cc/pybind and integration/.
+
+Claude-Session: https://claude.ai/code/session_01GwUvhmzgfkiZ6vo4uGyesN
+---
+ kokoro/gcp_ubuntu/pip/test_script.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kokoro/gcp_ubuntu/pip/test_script.sh b/kokoro/gcp_ubuntu/pip/test_script.sh
+index 116bdc6..001d413 100755
+--- a/kokoro/gcp_ubuntu/pip/test_script.sh
++++ b/kokoro/gcp_ubuntu/pip/test_script.sh
+@@ -82,7 +82,7 @@ else
+   TEST_EXCLUDE+=( -not -path "*integration/*" )
+ fi
+ readonly TEST_EXCLUDE
+-find tink/ "${TEST_EXCLUDE}" -type f -name "*_test.py" -print0 \
++find tink/ "${TEST_EXCLUDE[@]}" -type f -name "*_test.py" -print0 \
+   | xargs -0 -n1 python3
+ 
+ # Install requirements for examples.
+-- 
+2.51.0
+
