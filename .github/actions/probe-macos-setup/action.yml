@@ -1,0 +1,97 @@
+name: probe-macos-setup
+description: >-
+  CI probe: what Kokoro's macOS image provides for the tink-py release
+  scripts (a pre-installed pyenv, bazelisk, Rosetta for the x86_64 protoc,
+  protoc 29.5 as install_protoc.sh installs it), plus a local Bazel disk cache
+  in place of Kokoro's remote cache. The "image" pyenv is Homebrew's; the
+  scripts install their own with kokoro/testutils/install_pyenv.sh. With
+  `pythons` set, it also sources install_pyenv.sh and installs those Pythons
+  with that pyenv (cached), for jobs that only run tests: test_dist.sh then
+  finds them in the PYENV_ROOT of install_pyenv.sh.
+inputs:
+  pythons:
+    description: >-
+      Python versions to pre-install (cached) with the pyenv of
+      kokoro/testutils/install_pyenv.sh.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Tools
+      id: tools
+      shell: bash
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: '1'
+        HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: '1'
+        PYTHONS: ${{ inputs.pythons }}
+      run: |
+        set -euxo pipefail
+        sw_vers
+        uname -m
+        sysctl -n hw.ncpu hw.memsize
+        xcodebuild -version
+        clang --version
+        df -h /
+        /bin/bash --version | head -1
+        # The image's pyenv. python-build uses Homebrew's openssl@3, readline
+        # and xz.
+        brew install pyenv openssl@3 readline xz
+        pyenv --version
+        if [[ -n "${PYTHONS}" ]]; then
+          # Downloads pyenv into its PYENV_ROOT, as test_dist.sh would.
+          source ./kokoro/testutils/install_pyenv.sh
+          echo "pyenv-root=${PYENV_ROOT}" >> "${GITHUB_OUTPUT}"
+          echo "cache-key=pyenv-${ImageOS:-unknown}-$(uname -m)-$(basename "${PYENV_ROOT}")-$(echo "${PYTHONS}" | tr ' ' '_')" >> "${GITHUB_OUTPUT}"
+        fi
+        command -v sha256sum bazel bazelisk unzip
+        bazelisk version || true
+        if [[ "$(uname -m)" == "arm64" ]] \
+            && ! /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+          sudo softwareupdate --install-rosetta --agree-to-license
+        fi
+        echo "build --disk_cache=${HOME}/.cache/bazel-disk" >> "${HOME}/.bazelrc"
+        cat "${HOME}/.bazelrc"
+    - name: Restore pyenv versions
+      id: cache
+      if: inputs.pythons != ''
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.tools.outputs.pyenv-root }}/versions
+        key: ${{ steps.tools.outputs.cache-key }}
+    - name: pyenv install
+      if: inputs.pythons != '' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        PYTHONS: ${{ inputs.pythons }}
+      run: |
+        set -euxo pipefail
+        source ./kokoro/testutils/install_pyenv.sh
+        for v in ${PYTHONS}; do
+          pyenv install -s "${v}"
+        done
+    - name: Save pyenv versions
+      if: inputs.pythons != '' && steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ steps.tools.outputs.pyenv-root }}/versions
+        key: ${{ steps.tools.outputs.cache-key }}
+    - name: Installed pyenv versions
+      if: inputs.pythons != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        source ./kokoro/testutils/install_pyenv.sh
+        pyenv versions
+    - name: protoc 29.5 (as kokoro/testutils/install_protoc.sh installs it on Kokoro)
+      shell: bash
+      run: |
+        set -euo pipefail
+        command -v pyenv
+        pyenv --version
+        export KOKORO_ROOT=ci-probe
+        source ./kokoro/testutils/install_protoc.sh "29.5"
+        dirname "$(command -v protoc)" >> "${GITHUB_PATH}"
+        file "$(command -v protoc)"
+        protoc --version

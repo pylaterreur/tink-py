@@ -1,0 +1,459 @@
+# CI probe for tink-crypto/tink-py#103 (free-threaded Python 3.15t wheels),
+# rebased on main.
+#
+# Lives only on the ci-probe-py315-rebased branch of the pylaterreur/tink-py
+# fork. It runs the Kokoro release scripts of the branch on GitHub-hosted
+# runners for the platforms Kokoro builds on but that could not be tested
+# locally:
+#
+#   macOS (arm64 and x86_64 hosts): kokoro/macos_external/release/bdist/create/run.sh
+#     -> tools/distribution/create_bdist_macos.sh (universal2 wheels; it
+#     installs pyenv with kokoro/testutils/install_pyenv.sh) + test_dist.sh
+#   Windows x86_64: kokoro/gcp_windows/release/bdist/create/run.bat
+#   Linux (x86_64 and aarch64): kokoro/gcp_ubuntu/release/bdist/create/run.sh
+#     -> kokoro/testutils/docker_execute.sh runs
+#     tools/distribution/create_bdist_linux.sh in the MANYLINUX_CONTAINER_IMAGE
+#     container, then test_dist.sh on the host.
+#
+# Differences from Kokoro, all in the environment, none in the scripts:
+#   - No KMS credentials: the five AWS/GCP KMS integration tests that call the
+#     real services are deleted before the run. The HashiCorp Vault test runs
+#     against the local dev server, as on Kokoro.
+#   - A local Bazel disk cache replaces Kokoro's optional remote cache.
+#   - macOS: the image's pyenv is Homebrew's (create_bdist_macos.sh and
+#     test_dist.sh install their own with install_pyenv.sh, as on Kokoro), and
+#     protoc 29.5 comes from install_protoc.sh run with KOKORO_ROOT set.
+#   - Linux: Kokoro builds in the private linux-tink-py-manylinux{,-arm64}
+#     images. The probe builds in .github/ci-probe/manylinux.Dockerfile (the
+#     manylinux_2_28 image the scripts pinned until 16f8000, plus the bazelisk
+#     and protoc that build_linux_binary_wheels.sh installed), pushed to a
+#     local registry because docker_execute.sh always pulls the image. The
+#     tests run on the runner with pyenv 2.8.15 instead of the private
+#     linux-tink-py-base{,-arm64} images (CONTAINER_IMAGE unset).
+#   - Windows: actions/setup-python (3.11 to 3.14) and the python.org 3.15
+#     installer with the free-threaded binaries, all found through the py
+#     launcher, and the bazelisk.exe release instead of the image's npm shim.
+#
+# The kokoro/*/run.sh job scripts are mode 100644 in git, so they are run with
+# `bash`, as Kokoro does; the scripts they call are executable.
+#
+# The `versions` input rewrites the version lists of the scripts with
+# .github/ci-probe/select_versions.py; leave it empty to run them unmodified.
+name: ci-probe-py315
+
+on:
+  # Only registers the workflow (a push runs nothing but the `register` job).
+  push:
+    branches: [ci-probe-py315-rebased]
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: >-
+          Space-separated subset of: macos-arm64 macos-x86_64 windows
+          linux-x86_64 linux-arm64
+        default: macos-arm64 macos-x86_64 windows linux-x86_64 linux-arm64
+      versions:
+        description: >-
+          Override the Python versions of the bdist scripts (e.g. "3.14 3.15
+          3.15t"); empty runs the scripts unmodified.
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  # Versions pre-installed with pyenv (and cached) for the jobs that only test.
+  PYENV_PYTHONS: 3.11 3.12 3.13 3.14 3.15 3.15t
+  # The live KMS tests, which need Kokoro's AWS/GCP credentials.
+  LIVE_KMS_TESTS: >-
+    tink/integration/awskms/_aws_kms_integration_test.py
+    tink/integration/gcpkms/_gcp_kms_client_integration_test.py
+    tink/integration/gcpkms/_gcp_kms_integration_test.py
+    tink/integration/gcpkms/_gcp_kms_mac_integration_test.py
+    tink/integration/gcpkms/_gcp_kms_signature_integration_test.py
+
+jobs:
+  register:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Registered. Run it with gh workflow run ci-probe-py315.yml --ref ci-probe-py315-rebased"
+
+  plan:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    outputs:
+      macos: ${{ steps.plan.outputs.macos }}
+      macos_cross: ${{ steps.plan.outputs.macos_cross }}
+      linux: ${{ steps.plan.outputs.linux }}
+      windows: ${{ steps.plan.outputs.windows }}
+    steps:
+      - id: plan
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        shell: python3 {0}
+        run: |
+          import json, os
+          selected = set(os.environ['PLATFORMS'].split())
+          runners = {'arm64': 'macos-15', 'x86_64': 'macos-15-intel'}
+          other = {'arm64': 'x86_64', 'x86_64': 'arm64'}
+          macos = [{'name': f'macos-{a}', 'runner': r}
+                   for a, r in runners.items() if f'macos-{a}' in selected]
+          # Each universal2 wheel is tested natively on the other architecture.
+          macos_cross = [{'name': f'macos-{other[a]}-tests-macos-{a}-wheels',
+                          'runner': runners[other[a]],
+                          'wheels': f'wheels-macos-{a}'}
+                         for a in runners if f'macos-{a}' in selected]
+          linux = [{'name': n, 'runner': r}
+                   for n, r in (('linux-x86_64', 'ubuntu-24.04'),
+                                ('linux-arm64', 'ubuntu-24.04-arm'))
+                   if n in selected]
+          windows = ([{'name': 'windows-x86_64', 'runner': 'windows-2022'}]
+                     if 'windows' in selected else [])
+          known = {m['name'] for m in macos + linux} | {'windows'}
+          unknown = selected - known
+          if unknown:
+            raise SystemExit(f'unknown platforms: {sorted(unknown)}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            for key, value in (('macos', macos), ('macos_cross', macos_cross),
+                               ('linux', linux), ('windows', windows)):
+              f.write(f'{key}={json.dumps(value)}\n')
+              print(key, value)
+
+  macos:
+    needs: plan
+    if: needs.plan.outputs.macos != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.macos) }}
+    name: ${{ matrix.name }} run.sh
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/probe-macos-setup
+      - name: Delete the live KMS tests (no credentials)
+        run: |
+          read -r -a tests <<< "${LIVE_KMS_TESTS}"
+          rm -v "${tests[@]}"
+      - name: Restrict the scripts to ${{ inputs.versions }}
+        if: inputs.versions != ''
+        run: python3 .github/ci-probe/select_versions.py ${{ inputs.versions }} && git diff
+      - name: kokoro/macos_external/release/bdist/create/run.sh
+        run: |
+          set -euo pipefail
+          trap 'pkill -f "[v]ault server" || true' EXIT
+          bash ./kokoro/macos_external/release/bdist/create/run.sh
+      - name: ABI of the wheels
+        if: always()
+        run: .github/ci-probe/abi_check.sh release
+      - name: Smoke test every wheel (Pythons that run.sh installed)
+        if: always()
+        run: |
+          set -o pipefail
+          # The pyenv that create_bdist_macos.sh and test_dist.sh installed.
+          source ./kokoro/testutils/install_pyenv.sh
+          set +eu
+          .github/ci-probe/smoke_all.sh release | tee smoke.log
+          rc=$?
+          grep '^RESULT' smoke.log >> "${GITHUB_STEP_SUMMARY}" || true
+          exit "${rc}"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: wheels-${{ matrix.name }}
+          path: release/*.whl
+          if-no-files-found: warn
+
+  macos-crosstest:
+    needs: [plan, macos]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.macos_cross != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.macos_cross) }}
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/probe-macos-setup
+        with:
+          pythons: ${{ env.PYENV_PYTHONS }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.wheels }}
+          path: release
+      - name: Delete the live KMS tests (no credentials)
+        run: |
+          read -r -a tests <<< "${LIVE_KMS_TESTS}"
+          rm -v "${tests[@]}"
+      - name: Test half of run.sh (install_vault.sh, Vault dev server, test_dist.sh)
+        run: |
+          set -euo pipefail
+          trap 'pkill -f "[v]ault server" || true' EXIT
+          ls -l release
+          source ./kokoro/testutils/install_vault.sh
+          source ./kokoro/testutils/run_hcvault_test_server.sh
+          vault write -f transit/keys/key-1
+          ./tools/distribution/test_dist.sh release
+      - name: Smoke test every wheel
+        if: always()
+        run: |
+          set -o pipefail
+          source ./kokoro/testutils/install_pyenv.sh
+          set +eu
+          .github/ci-probe/smoke_all.sh release | tee smoke.log
+          rc=$?
+          grep '^RESULT' smoke.log >> "${GITHUB_STEP_SUMMARY}" || true
+          exit "${rc}"
+
+  windows:
+    needs: plan
+    if: needs.plan.outputs.windows != '[]'
+    name: windows-x86_64 run.bat
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # run.bat expects %KOKORO_ARTIFACTS_DIR%\git\tink_py.
+          path: git/tink_py
+      - uses: actions/setup-python@v7
+        with:
+          python-version: |
+            3.11
+            3.12
+            3.13
+            3.14
+      # setup-python's free-threaded 3.15 registers itself as both 3.15 and
+      # 3.15t, so `py -3.15` started the free-threaded build. Install 3.15 the
+      # way a python.org install would be on an image instead: one installer
+      # run with the free-threaded binaries, python.exe registered as 3.15
+      # and python3.15t.exe as 3.15t. The image's own 3.15.2 is uninstalled
+      # first, or the installer would only modify it.
+      - name: Python 3.15 and 3.15t from the python.org installer
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\python-3.15.2-amd64.exe"
+          Invoke-WebRequest https://www.python.org/ftp/python/3.15.2/python-3.15.2-amd64.exe -OutFile $exe
+          Get-FileHash $exe -Algorithm SHA256 | Format-List
+          $p = Start-Process -Wait -PassThru -FilePath $exe -ArgumentList '/uninstall','/quiet','/log',"$env:RUNNER_TEMP\py315-uninstall.log"
+          "uninstall exit code: $($p.ExitCode)"
+          $p = Start-Process -Wait -PassThru -FilePath $exe -ArgumentList '/quiet','/log',"$env:RUNNER_TEMP\py315-install.log",'InstallAllUsers=1','TargetDir=C:\Python315','Include_freethreaded=1','Include_launcher=0','Include_test=0','Include_doc=0','Shortcuts=0','PrependPath=0'
+          "install exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { Get-Content "$env:RUNNER_TEMP\py315-install.log" -Tail 50; throw "python.org installer failed" }
+          Get-ChildItem C:\Python315\python*.exe | Format-Table Name, Length
+      # The image's bazelisk is an npm .cmd/.ps1 shim, which setup.py cannot
+      # spawn (it runs the bare name, and CreateProcess only adds .exe). Use
+      # the bazelisk.exe release that build_linux_binary_wheels.sh pinned for
+      # Linux.
+      - name: bazelisk.exe 1.30.0
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force C:\bazelisk | Out-Null
+          Invoke-WebRequest https://github.com/bazelbuild/bazelisk/releases/download/v1.30.0/bazelisk-windows-amd64.exe -OutFile C:\bazelisk\bazelisk.exe
+          $h = (Get-FileHash C:\bazelisk\bazelisk.exe -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne '5d14a31e9d8a363c48ba1900dbd56764d730835232eb0d113cce255856ffe3ef') { throw "bazelisk sha256 mismatch: $h" }
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\bazelisk'
+      - name: Check that the py launcher finds every Python run.bat uses
+        shell: pwsh
+        run: |
+          py --list-paths
+          foreach ($v in '3.11','3.12','3.13','3.14','3.15','3.15t') {
+            py -$v -c "import sys, sysconfig; print(sys.executable, sys.version, 'Py_GIL_DISABLED =', sysconfig.get_config_var('Py_GIL_DISABLED'))"
+            if ($LASTEXITCODE -ne 0) { throw "py -$v failed" }
+          }
+          $ft = py -3.15 -c "import sysconfig; print(sysconfig.get_config_var('Py_GIL_DISABLED') or 0)"
+          if ($ft -ne '0') { throw "py -3.15 is a free-threaded build" }
+          $ft = py -3.15t -c "import sysconfig; print(sysconfig.get_config_var('Py_GIL_DISABLED') or 0)"
+          if ($ft -ne '1') { throw "py -3.15t is not a free-threaded build" }
+          Get-Command bazel, bazelisk -All -ErrorAction SilentlyContinue | Format-Table Name, Source
+          py -3.14 -c "import shutil; print('setup.py will run', shutil.which('bazelisk'))"
+          Push-Location git/tink_py
+          bazelisk version
+          Pop-Location
+          Add-Content -Path "$env:USERPROFILE\.bazelrc" -Value "build --disk_cache=C:/bazel-disk"
+          Get-Content "$env:USERPROFILE\.bazelrc"
+      - name: Restrict the scripts to ${{ inputs.versions }}
+        if: inputs.versions != ''
+        working-directory: git/tink_py
+        run: |
+          python .github/ci-probe/select_versions.py ${{ inputs.versions }}
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git diff
+      # Shows why run.bat needs a virtual environment per Python version:
+      # python.exe and python3.15t.exe from one installer share site-packages,
+      # so the free-threaded build imports extensions installed for the
+      # default build (here protobuf's abi3 one).
+      - name: 3.15 and 3.15t share site-packages
+        shell: pwsh
+        working-directory: git/tink_py
+        run: |
+          py -3.15 -c "import sys, sysconfig; print(sys.executable, sysconfig.get_paths()['purelib'])"
+          py -3.15t -c "import sys, sysconfig; print(sys.executable, sysconfig.get_paths()['purelib'])"
+          py -3.15 -m pip install -q --no-deps --require-hashes -r requirements.txt
+          py -3.15 -c "import google._upb._message as m; print('3.15 loads', m.__file__)"
+          py -3.15t -X faulthandler -c "import google._upb._message as m; print('3.15t loads', m.__file__)"
+          $status = $LASTEXITCODE
+          "RESULT: py -3.15t importing protobuf installed by py -3.15: exit $status" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          py -3.15 -m pip uninstall -q -y protobuf absl-py bazel-runfiles
+          exit 0
+      - name: kokoro/gcp_windows/release/bdist/create/run.bat
+        shell: cmd
+        env:
+          KOKORO_ARTIFACTS_DIR: ${{ github.workspace }}
+        run: |
+          CALL "%KOKORO_ARTIFACTS_DIR%\git\tink_py\kokoro\gcp_windows\release\bdist\create\run.bat"
+          IF ERRORLEVEL 1 EXIT /B 1
+      - name: ABI of the wheels
+        if: always()
+        working-directory: git/tink_py
+        shell: pwsh
+        run: |
+          py -3.14 -m pip install -q pefile
+          py -3.14 .github\ci-probe\abi_check_windows.py release
+      - name: Smoke test every wheel
+        if: always()
+        working-directory: git/tink_py
+        shell: pwsh
+        run: |
+          $rc = 0
+          foreach ($w in Get-ChildItem release\tink-*.whl) {
+            if ($w.Name -notmatch '^tink-[^-]+-cp3\d+-cp3(\d+)(t?)-') { continue }
+            $v = "3.$($Matches[1])$($Matches[2])"
+            # run.bat installed the wheel and its dependencies, in a virtual
+            # environment per version.
+            $venv = "$env:TEMP\tink_py_venv_$v\Scripts\python.exe"
+            if (Test-Path $venv) { $where = "venv of py -$v" } else { $where = "py -$v" }
+            Write-Output "::group::smoke $($w.Name) in $where"
+            if (Test-Path $venv) { & $venv -I -X faulthandler .github\ci-probe\smoke.py }
+            else { py -$v -I -X faulthandler .github\ci-probe\smoke.py }
+            $status = $LASTEXITCODE
+            Write-Output "::endgroup::"
+            if ($status -eq 0) { $line = "RESULT: $($w.Name) in ${where}: OK" }
+            else { $line = "RESULT: $($w.Name) in ${where}: FAIL (exit $status)"; $rc = 1 }
+            Write-Output $line
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line
+          }
+          exit $rc
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: wheels-windows-x86_64
+          path: git/tink_py/release/*.whl
+          if-no-files-found: warn
+
+  linux:
+    needs: plan
+    if: needs.plan.outputs.linux != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.linux) }}
+    name: ${{ matrix.name }} run.sh
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tools (pyenv and what it needs to build Pythons)
+        id: tools
+        run: |
+          set -euxo pipefail
+          uname -a
+          nproc
+          free -g
+          df -h / /tmp
+          docker version
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends build-essential \
+            libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+            libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev \
+            libffi-dev liblzma-dev unzip
+          git clone --quiet --depth 1 --branch v2.8.15 \
+            https://github.com/pyenv/pyenv.git "${HOME}/.pyenv"
+          echo "PYENV_ROOT=${HOME}/.pyenv" >> "${GITHUB_ENV}"
+          echo "${HOME}/.pyenv/bin" >> "${GITHUB_PATH}"
+          echo "cache-key=pyenv-${ImageOS:-unknown}-$(uname -m)-v2.8.15-$(echo "${PYENV_PYTHONS}" | tr ' ' '_')" >> "${GITHUB_OUTPUT}"
+      - name: Restore pyenv versions
+        id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.pyenv/versions
+          key: ${{ steps.tools.outputs.cache-key }}
+      - name: pyenv install
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          for v in ${PYENV_PYTHONS}; do
+            pyenv install -s "${v}"
+          done
+      - name: Save pyenv versions
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.pyenv/versions
+          key: ${{ steps.tools.outputs.cache-key }}
+      # docker_execute.sh runs `docker pull` before `docker run`, so the image
+      # is served from a registry on the runner.
+      - name: Build image (stands in for linux-tink-py-manylinux)
+        id: manylinux
+        run: |
+          set -euxo pipefail
+          case "$(uname -m)" in
+            x86_64)
+              base="quay.io/pypa/manylinux_2_28_x86_64:2026.10.26-1@sha256:e0adf18521ad35192df733a6c62d35df7801957d24e0470238aacecfab2188a3"
+              ;;
+            aarch64)
+              base="quay.io/pypa/manylinux_2_28_aarch64:2026.10.26-1@sha256:a3e02308c822fb6ce0d12248b0c941817ba5e1a1bc9e7bb5929f29c50eaa40a9"
+              ;;
+          esac
+          image="localhost:5000/linux-tink-py-manylinux:ci-probe"
+          docker run -d --rm -p 127.0.0.1:5000:5000 --name registry registry:3.0.0
+          docker build --build-arg "BASE_IMAGE=${base}" -t "${image}" \
+            -f .github/ci-probe/manylinux.Dockerfile .github/ci-probe
+          for _ in $(seq 30); do
+            curl -fsS http://127.0.0.1:5000/v2/ && break
+            sleep 1
+          done
+          docker push "${image}"
+          docker run --rm "${image}" bash -c \
+            'ls /opt/python; command -v bazelisk protoc; protoc --version; echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"'
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+      - name: Bazel disk cache (/tmp is mounted into the manylinux container)
+        run: |
+          pyenv versions
+          echo "build --disk_cache=/tmp/bazel-disk-cache" >> .bazelrc
+          git diff .bazelrc
+      - name: Delete the live KMS tests (no credentials)
+        run: |
+          read -r -a tests <<< "${LIVE_KMS_TESTS}"
+          rm -v "${tests[@]}"
+      - name: Restrict the scripts to ${{ inputs.versions }}
+        if: inputs.versions != ''
+        run: python3 .github/ci-probe/select_versions.py ${{ inputs.versions }} && git diff
+      - name: kokoro/gcp_ubuntu/release/bdist/create/run.sh
+        env:
+          MANYLINUX_CONTAINER_IMAGE: ${{ steps.manylinux.outputs.image }}
+        run: |
+          set -euo pipefail
+          trap 'pkill -f "[v]ault server" || true' EXIT
+          bash ./kokoro/gcp_ubuntu/release/bdist/create/run.sh
+      - name: ABI of the wheels
+        if: always()
+        run: .github/ci-probe/abi_check.sh release
+      - name: Smoke test every wheel
+        if: always()
+        run: |
+          set +e -o pipefail
+          .github/ci-probe/smoke_all.sh release | tee smoke.log
+          rc=$?
+          grep '^RESULT' smoke.log >> "${GITHUB_STEP_SUMMARY}" || true
+          exit "${rc}"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: wheels-${{ matrix.name }}
+          path: release/*.whl
+          if-no-files-found: warn
